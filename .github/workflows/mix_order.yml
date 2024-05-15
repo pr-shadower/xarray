@@ -1,0 +1,133 @@
+name: mix_order
+on:
+  push:
+  pull_request:
+  workflow_dispatch: # allows you to trigger manually
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} py${{ matrix.python-version }} ${{ matrix.env }}
+    runs-on: ${{ matrix.os }}
+    # if: |
+    #   github.repository == 'pydata/xarray'
+    #   && (github.event_name == 'push' || github.event_name == 'pull_request')
+    # outputs:
+    #   triggered: ${{ steps.detect-trigger.outputs.trigger-found }}
+    env:
+      ZARR_V3_EXPERIMENTAL_API: 1
+    defaults:
+      run:
+        shell: bash -l {0}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["ubuntu-latest"] #["ubuntu-latest", "macos-latest", "windows-latest"]
+        # Bookend python versions
+        python-version: ["3.12"] #["3.9",  "3.12"]
+        env: [""]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetch all history for all branches and tags.
+      - name: Set environment variables
+        run: |
+          echo "TODAY=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
+
+          if [[ ${{ matrix.os }} == windows* ]] ;
+          then
+            if [[ ${{ matrix.python-version }} != "3.13" ]]; then
+              echo "CONDA_ENV_FILE=ci/requirements/environment-windows.yml" >> $GITHUB_ENV
+            else
+              echo "CONDA_ENV_FILE=ci/requirements/environment-windows-3.13.yml" >> $GITHUB_ENV
+            fi
+          elif [[ "${{ matrix.env }}" != "" ]] ;
+          then
+            if [[ "${{ matrix.env }}" == "flaky" ]] ;
+            then
+              echo "CONDA_ENV_FILE=ci/requirements/environment.yml" >> $GITHUB_ENV
+              echo "PYTEST_ADDOPTS=-m 'flaky or network' --run-flaky --run-network-tests -W default" >> $GITHUB_ENV
+            else
+              echo "CONDA_ENV_FILE=ci/requirements/${{ matrix.env }}.yml" >> $GITHUB_ENV
+            fi
+            if [[ "${{ matrix.env }}" == "min-all-deps" ]] ;
+            then
+              # Don't raise on warnings
+              echo "PYTEST_ADDOPTS=-W default" >> $GITHUB_ENV
+            fi
+          else
+            if [[ ${{ matrix.python-version }} != "3.13" ]]; then
+              echo "CONDA_ENV_FILE=ci/requirements/environment.yml" >> $GITHUB_ENV
+            else
+              echo "CONDA_ENV_FILE=ci/requirements/environment-3.13.yml" >> $GITHUB_ENV
+            fi
+          fi
+
+          echo "PYTHON_VERSION=${{ matrix.python-version }}" >> $GITHUB_ENV
+
+      - name: Setup micromamba
+        uses: mamba-org/setup-micromamba@v1
+        with:
+          environment-file: ${{ env.CONDA_ENV_FILE }}
+          environment-name: xarray-tests
+          cache-environment: true
+          cache-environment-key: "${{runner.os}}-${{runner.arch}}-py${{matrix.python-version}}-${{env.TODAY}}-${{hashFiles(env.CONDA_ENV_FILE)}}"
+          create-args: >-
+            python=${{matrix.python-version}}
+            conda
+
+      # We only want to install this on one run, because otherwise we'll have
+      # duplicate annotations.
+      - name: Install error reporter
+        if: ${{ matrix.os }} == 'ubuntu-latest' and ${{ matrix.python-version }} == '3.12'
+        run: |
+          python -m pip install pytest-github-actions-annotate-failures
+
+      - name: Install xarray
+        run: |
+          python -m pip install --no-deps -e .
+
+      - name: Version info
+        run: |
+          conda info -a
+          conda list
+          python xarray/util/print_versions.py
+
+      - name: Import xarray
+        run: |
+          python -c "import xarray"
+
+      - name: Restore cached hypothesis directory
+        uses: actions/cache@v4
+        with:
+          path: .hypothesis/
+          key: cache-hypothesis
+          enableCrossOsArchive: true
+          save-always: true
+      
+      - name: Install pytest-ranking
+        run: python -m pip install pytest-ranking
+
+      - name: Restore pytest-ranking cache
+        id: restore-pytest-ranking-cache
+        if: always()
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.pytest_cache/v/pytest_ranking_data
+          key: pytest-ranking-cache-${{ github.workflow }}-${{ runner.os }}-${{ matrix.python }}
+      
+      - name: Run tests
+        run: |
+          python -m pytest -n 4 -v --durations=0 --timeout 180 --cov=xarray --cov-report=xml --junitxml=pytest.xml --rank --rank-weight=1-1-1
+      
+      - name: Save pytest-ranking cache
+        id: save-pytest-ranking-cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.pytest_cache/v/pytest_ranking_data
+          key: pytest-ranking-cache-${{ github.workflow }}-${{ runner.os }}-${{ matrix.python }}-${{ github.run_id }}
+
